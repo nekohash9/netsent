@@ -1,3 +1,54 @@
+# byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editor folders
+.vscode/
+.idea/
+
+# test / coverage
+.pytest_cache/
+coverage/
+
+# type checkers
+.mypy_cache/
+
+# database files
+netsent.db
+*.db
+
+# environment variables
+.env
+
+# OS files
+.DS_Store
 .venv/
 env/
 

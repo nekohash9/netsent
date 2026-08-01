@@ -10,12 +10,11 @@ currently a pet project built for educational purposes
 - detects NEW and CLOSED connections
 - stores events in SQLite
 
-psutil
-   ↓
-connection snapshot
-   ↓
-compare snapshots
-   ↓
-NEW / CLOSED event
-   ├── terminal
-   └── SQLite
+```mermaid
+flowchart LR
+  A[psutil] --> B[connection snapshot]
+  B --> C[compare snapshots]
+  C --> D[NEW / CLOSED event]
+  D --> E[Terminal]
+  D --> F[SQLite]
+```
