@@ -2,8 +2,13 @@ import os
 import socket
 import sys
 import time
+import numpy as np
 import psutil
 import database
+from features import Event, Windower, build_windows, events_from_db_rows
+
+MODEL_PATH = "model.npz"
+WINDOW_SEC = 10.0
 
 # cache dictionary to store process names: {pid: name}
 _process_names_cache = {}
@@ -11,7 +16,8 @@ _process_names_cache = {}
 
 def check_root():
     """checks if the script is running with root/sudo privileges."""
-    if os.geteuid() != 0:
+    # windows has no geteuid and psutil sees all sockets there without elevation
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
         print("(!) this script must be run as root. please run with sudo")
         print("    example: sudo .venv/bin/python3 main.py")
         sys.exit(1)
@@ -75,6 +81,23 @@ def show_active_sessions(current_pid: int, show_header: bool = True):
         print(format_connection(conn_id, snapshot[conn_id], current_pid))
 
 
+def diff_snapshots(old_snapshot: dict, new_snapshot: dict, now: float):
+    """returns db rows and model events for connections that appeared or disappeared"""
+    current_time = time.strftime("%H:%M:%S", time.localtime(now))
+    changes = []
+    for kind, ids, source in (("NEW", new_snapshot.keys() - old_snapshot.keys(), new_snapshot),
+                              ("CLOSED", old_snapshot.keys() - new_snapshot.keys(), old_snapshot)):
+        for conn_id in sorted(ids, key=lambda x: str(x[0])):
+            laddr, raddr, pid, proto = conn_id
+            status, pname, proto = source[conn_id]
+            l_ip, l_port = laddr if laddr else (None, None)
+            r_ip, r_port = raddr if raddr else (None, None)
+            row = (current_time, kind, pid, pname, l_ip, l_port, r_ip, r_port, status, proto, now)
+            event = Event(now, kind, pname, r_ip, r_port, l_port, status, proto)
+            changes.append((kind, conn_id, source[conn_id], row, event))
+    return changes
+
+
 def watch_active_sessions(current_pid: int):
     """monitors network connections, prints diffs, and saves events to sqlite."""
     print("(?) watch command monitors network connections and logs events to sqlite")
@@ -90,56 +113,26 @@ def watch_active_sessions(current_pid: int):
             
             # 2. get the new snapshot dictionary
             new_snapshot = get_connection_snapshot()
-            
-            # 3. extract sets of connection identities (keys) to find diffs
-            old_ids = set(old_snapshot.keys())
-            new_ids = set(new_snapshot.keys())
-            
-            new_conns = new_ids - old_ids      # appeared in new snapshot
-            closed_conns = old_ids - new_ids   # disappeared from new snapshot
-            
+            now = time.time()
+
+            # 3. find connections that appeared or disappeared
+            changes = diff_snapshots(old_snapshot, new_snapshot, now)
+
             # if changes detected, log to terminal and save to sqlite
-            if new_conns or closed_conns:
-                current_time = time.strftime("%H:%M:%S")
-                print(f"--- changes detected at {current_time} ---")
-                
-                if new_conns:
-                    print("[NEW]")
-                    batch = []
-                    for conn_id in sorted(new_conns, key=lambda x: str(x[0])):
-                        laddr, raddr, pid, proto = conn_id
-                        status, pname, proto = new_snapshot[conn_id]
-                        l_ip, l_port = laddr if laddr else (None, None)
-                        r_ip, r_port = raddr if raddr else (None, None)
-                        
-                        # print to terminal
-                        print(f"  + {format_connection(conn_id, (status, pname, proto), current_pid)}")
-                        batch.append((current_time, "NEW", pid, pname, l_ip, l_port, r_ip, r_port, status, proto))
-
-                    if batch:
-                        database.save_events_batch(batch)
-                
-                if closed_conns:
-                    print("[CLOSED]")
-                    batch = []
-                    for conn_id in sorted(closed_conns, key=lambda x: str(x[0])):
-                        laddr, raddr, pid, proto = conn_id
-                        status, pname, proto = old_snapshot[conn_id]
-                        l_ip, l_port = laddr if laddr else (None, None)
-                        r_ip, r_port = raddr if raddr else (None, None)
-                        
-                        # print to terminal
-                        print(f"  - {format_connection(conn_id, (status, pname, proto), current_pid)}")
-                        batch.append((current_time, "CLOSED", pid, pname, l_ip, l_port, r_ip, r_port, status, proto))
-                        
+            if changes:
+                print(f"--- changes detected at {time.strftime('%H:%M:%S', time.localtime(now))} ---")
+                for kind, marker in (("NEW", "+"), ("CLOSED", "-")):
+                    group = [c for c in changes if c[0] == kind]
+                    if group:
+                        print(f"[{kind}]")
+                    for _, conn_id, metadata, _, _ in group:
+                        print(f"  {marker} {format_connection(conn_id, metadata, current_pid)}")
                         # clean up closed pids from name cache
-                        _process_names_cache.pop(pid, None)
-
-                    if batch:
-                        database.save_events_batch(batch)
-                
+                        if kind == "CLOSED":
+                            _process_names_cache.pop(conn_id[2], None)
+                database.save_events_batch([c[3] for c in changes])
                 print()  # empty line for visual separation
-            
+
             # 4. update baseline for the next iteration
             old_snapshot = new_snapshot
             
@@ -148,6 +141,66 @@ def watch_active_sessions(current_pid: int):
     except Exception as e:
         print(f"[!] Watch loop error: {e}. Retrying in 5s...")
         time.sleep(5)
+
+
+def train_model():
+    """trains the autoencoder on everything logged by watch or detect so far"""
+    from detector import Detector
+
+    events = events_from_db_rows(database.load_events())
+    rows, ip_history = build_windows(events, WINDOW_SEC)
+    if len(rows) < 200:
+        print(f"(!) only {len(rows)} windows of traffic logged. run watch for a few hours first")
+        return
+    hours = (events[-1].ts - events[0].ts) / 3600
+    print(f"[*] {len(events)} events over {hours:.1f}h -> {len(rows)} windows of {WINDOW_SEC:g}s")
+
+    detector = Detector().fit(np.stack([r.x for r in rows]))
+    detector.ip_history = ip_history
+    detector.save(MODEL_PATH)
+    print(f"[*] model saved to {MODEL_PATH} (threshold {detector.threshold:.3f})")
+
+
+def detect_anomalies(current_pid: int):
+    """scores live traffic window by window and prints explained alerts"""
+    from detector import Detector
+
+    if not os.path.exists(MODEL_PATH):
+        print("(!) no trained model found. run watch to collect normal traffic then train")
+        return
+    detector = Detector.load(MODEL_PATH)
+    windower = Windower(WINDOW_SEC, detector.ip_history)
+    print(f"(?) detect scores every {WINDOW_SEC:g}s window per process (threshold {detector.threshold:.3f})")
+    print("press Ctrl+C to exit detect mode.\n")
+
+    old_snapshot = get_connection_snapshot()
+    try:
+        while True:
+            # shorter poll than watch so short lived connections are less likely to be missed
+            time.sleep(1)
+            new_snapshot = get_connection_snapshot()
+            now = time.time()
+            changes = diff_snapshots(old_snapshot, new_snapshot, now)
+            old_snapshot = new_snapshot
+            database.save_events_batch([c[3] for c in changes])
+
+            rows = windower.flush(now)
+            for c in changes:
+                rows.extend(windower.push(c[4]))
+            if not rows:
+                continue
+
+            scores = detector.score(np.stack([r.x for r in rows]))
+            stamp = time.strftime("%H:%M:%S", time.localtime(rows[0].start))
+            worst = max(range(len(rows)), key=lambda i: scores[i])
+            print(f"[{stamp}] {len(rows)} active processes, max score {scores[worst]:.2f} ({rows[worst].pname})")
+            for row, score in zip(rows, scores):
+                if score > detector.threshold:
+                    print(f"  (!) ALERT [{row.pname}] score {score:.2f}")
+                    for _, share, text in detector.explain(row.x):
+                        print(f"      - {text} [{share:.0%} of error]")
+    except KeyboardInterrupt:
+        print("\n exiting detect mode.")
 
 
 def main():
@@ -161,7 +214,7 @@ def main():
     current_pid = os.getpid()
 
     while True:
-        print("\ncommands: active_sessions, watch, exit")
+        print("\ncommands: active_sessions, watch, train, detect, exit")
         command = input("> ").strip()
 
         match command:
@@ -169,6 +222,10 @@ def main():
                 show_active_sessions(current_pid)
             case "watch":
                 watch_active_sessions(current_pid)
+            case "train":
+                train_model()
+            case "detect":
+                detect_anomalies(current_pid)
             case "exit":
                 break
             case _:

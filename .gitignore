@@ -59,4 +59,6 @@ env/
 __pycache__/
 *.py[cod]
 *$py.class
-EOT
+
+# trained model
+model.npz
